@@ -177,8 +177,17 @@ func (s *Store) RespondReport(ctx context.Context, reportID, action, message str
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var agentID string
-	if err := tx.QueryRow(ctx, `UPDATE reports SET status=$2 WHERE id=$1 RETURNING agent_id`, reportID, status).Scan(&agentID); err != nil {
+	var projectID string
+	var stageID *string
+	if err := tx.QueryRow(ctx, `UPDATE reports SET status=$2 WHERE id=$1 RETURNING agent_id, project_id, stage_id`, reportID, status).Scan(&agentID, &projectID, &stageID); err != nil {
 		return "", fmt.Errorf("update report: %w", err)
+	}
+	// Al APROBAR un reporte de etapa: esa etapa pasa a 'hecha' y la siguiente a 'activa'.
+	if action == "aprobar" && stageID != nil {
+		var num int
+		if err := tx.QueryRow(ctx, `UPDATE stages SET status='hecha', ended_at=now() WHERE id=$1 RETURNING number`, *stageID).Scan(&num); err == nil {
+			_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE project_id=$1 AND number=$2 AND status='pendiente'`, projectID, num+1)
+		}
 	}
 	if message != "" {
 		if _, err := tx.Exec(ctx, `INSERT INTO messages (report_id, sender, body) VALUES ($1,'jefe',$2)`, reportID, message); err != nil {
