@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -86,21 +87,31 @@ func main() {
 	// ─── Servidor MCP ───
 	mcpSrv := server.NewMCPServer("onix-orchestrator", version)
 	mcpSrv.AddTool(
+		mcp.NewTool("consultar_ticket",
+			mcp.WithDescription("Devuelve el ticket a trabajar (título, cuerpo, estado) para que generes el plan de ejecución."),
+		), a.consultarTicket)
+	mcpSrv.AddTool(
+		mcp.NewTool("registrar_plan",
+			mcp.WithDescription("Envía el PLAN de ejecución del ticket (lista de fases). Crea las fases reales, lo manda a aprobar al jefe y BLOQUEA hasta su decisión (aprobar/cambios)."),
+			mcp.WithString("summary", mcp.Description("Resumen del plan propuesto.")),
+			mcp.WithArray("stages", mcp.Required(), mcp.Description("Fases del plan en orden. Cada una: {name, description?, depends_on?(número de fase)}.")),
+		), a.registrarPlan)
+	mcpSrv.AddTool(
 		mcp.NewTool("reportar_al_jefe",
-			mcp.WithDescription("Cierra una etapa: crea un reporte, pausa tu sesión y espera la decisión del jefe. Bloqueante."),
-			mcp.WithNumber("stage", mcp.Required(), mcp.Description("Número de etapa (1..12) que reportas.")),
+			mcp.WithDescription("Cierra una fase del plan: crea un reporte, pausa tu sesión y espera la decisión del jefe. Bloqueante."),
+			mcp.WithNumber("stage", mcp.Required(), mcp.Description("Número de fase del plan que reportas.")),
 			mcp.WithString("summary", mcp.Required(), mcp.Description("Resumen de lo hecho.")),
 			mcp.WithArray("deliverables", mcp.Description("Entregables con su ruta/artefacto.")),
 			mcp.WithArray("decisions", mcp.Description("Decisiones que necesitan aprobación.")),
 		), a.reportarAlJefe)
 	mcpSrv.AddTool(
 		mcp.NewTool("pedir_al_jefe",
-			mcp.WithDescription("Pregunta bloqueante a mitad de etapa: espera la respuesta del jefe."),
+			mcp.WithDescription("Pregunta bloqueante a mitad de fase: espera la respuesta del jefe."),
 			mcp.WithString("question", mcp.Required(), mcp.Description("Pregunta para el jefe.")),
 		), a.pedirAlJefe)
 	mcpSrv.AddTool(
 		mcp.NewTool("consultar_plan",
-			mcp.WithDescription("Devuelve el plan de 12 etapas y la etapa actual."),
+			mcp.WithDescription("Devuelve el plan de ejecución del ticket vigente y la fase actual."),
 		), a.consultarPlan)
 
 	httpMCP := server.NewStreamableHTTPServer(mcpSrv,
@@ -159,6 +170,77 @@ func (a *app) identity(ctx context.Context) (session, project, role string) {
 	return
 }
 
+func (a *app) consultarTicket(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	_, project, _ := a.identity(ctx)
+	pid, err := a.st.EnsureProject(ctx, project)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	t, err := a.st.OpenTicket(ctx, pid)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if t == nil {
+		return mcp.NewToolResultText(`{"ticket":null,"message":"No hay ticket pendiente de planear."}`), nil
+	}
+	out, _ := json.Marshal(map[string]any{"ticket_id": t.ID, "title": t.Title, "body": t.Body, "status": t.Status})
+	return mcp.NewToolResultText(string(out)), nil
+}
+
+func (a *app) registrarPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	session, project, role := a.identity(ctx)
+	args := req.GetArguments()
+	summary := toStr(args["summary"])
+	plan := toPlanStages(args["stages"])
+	if len(plan) == 0 {
+		return mcp.NewToolResultError("stages vacío: envía al menos una fase"), nil
+	}
+
+	pid, err := a.st.EnsureProject(ctx, project)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	aid, err := a.st.EnsureAgent(ctx, pid, role)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	sid, err := a.st.EnsureSession(ctx, pid, aid, session)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// Ticket a planear: el abierto, o uno nuevo si no hay.
+	t, _ := a.st.OpenTicket(ctx, pid)
+	var ticketID string
+	if t != nil {
+		ticketID = t.ID
+	} else {
+		if ticketID, err = a.st.CreateTicket(ctx, pid, "Ticket improvisado", summary, "plataforma"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+	if err := a.st.ReplaceTicketStages(ctx, pid, ticketID, plan); err != nil {
+		return mcp.NewToolResultError("no se pudieron crear las fases: " + err.Error()), nil
+	}
+	_ = a.st.SetTicketStatus(ctx, ticketID, "plan_espera")
+
+	names := make([]string, len(plan))
+	for i, p := range plan {
+		names[i] = fmt.Sprintf("%d. %s", i+1, p.Name)
+	}
+	reportID, err := a.st.CreateReport(ctx, pid, aid, ticketID, 0, "Plan de ejecución", summary, names, []string{"¿Apruebas este plan de ejecución?"})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	a.st.AgentMessage(ctx, reportID, summary)
+	_ = a.st.SetSessionStatus(ctx, sid, "pausada")
+	a.notifyReport(reportID, project)
+	slog.Info("plan registrado · esperando aprobación", "report_id", reportID, "ticket", ticketID, "fases", len(plan))
+
+	resp := a.waitForBoss(ctx, reportID, session)
+	out, _ := json.Marshal(resp)
+	return mcp.NewToolResultText(string(out)), nil
+}
+
 func (a *app) reportarAlJefe(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	session, project, role := a.identity(ctx)
 	args := req.GetArguments()
@@ -167,7 +249,7 @@ func (a *app) reportarAlJefe(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	deliverables := toStrSlice(args["deliverables"])
 	decisions := toStrSlice(args["decisions"])
 
-	reportID, err := a.openReport(ctx, project, role, session, stage, "Reporte de etapa "+strconv.Itoa(stage), summary, deliverables, decisions)
+	reportID, err := a.openReport(ctx, project, role, session, stage, "Reporte de fase "+strconv.Itoa(stage), summary, deliverables, decisions)
 	if err != nil {
 		return mcp.NewToolResultError("no se pudo crear el reporte: " + err.Error()), nil
 	}
@@ -192,10 +274,17 @@ func (a *app) pedirAlJefe(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 func (a *app) consultarPlan(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	_, project, _ := a.identity(ctx)
 	pid, err := a.st.EnsureProject(ctx, project)
-	if err == nil {
-		_ = a.st.SeedStages(ctx, pid)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	stages, current, err := a.st.Stages(ctx, pid)
+	ticketID, ok, err := a.st.LatestTicketID(ctx, pid)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if !ok {
+		return mcp.NewToolResultText(`{"current_stage":0,"stages":[],"message":"Aún no hay plan: usa registrar_plan."}`), nil
+	}
+	stages, current, err := a.st.StagesForTicket(ctx, ticketID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -203,13 +292,12 @@ func (a *app) consultarPlan(ctx context.Context, _ mcp.CallToolRequest) (*mcp.Ca
 	return mcp.NewToolResultText(string(out)), nil
 }
 
-// openReport hace el alta en DB y pausa la sesión. Devuelve el report_id.
+// openReport hace el alta en DB (ligado al ticket vigente) y pausa la sesión. Devuelve el report_id.
 func (a *app) openReport(ctx context.Context, project, role, session string, stage int, title, summary string, deliverables, decisions []string) (string, error) {
 	pid, err := a.st.EnsureProject(ctx, project)
 	if err != nil {
 		return "", err
 	}
-	_ = a.st.SeedStages(ctx, pid)
 	aid, err := a.st.EnsureAgent(ctx, pid, role)
 	if err != nil {
 		return "", err
@@ -218,7 +306,8 @@ func (a *app) openReport(ctx context.Context, project, role, session string, sta
 	if err != nil {
 		return "", err
 	}
-	reportID, err := a.st.CreateReport(ctx, pid, aid, stage, title, summary, deliverables, decisions)
+	ticketID, _, _ := a.st.LatestTicketID(ctx, pid) // "" si no hay ticket
+	reportID, err := a.st.CreateReport(ctx, pid, aid, ticketID, stage, title, summary, deliverables, decisions)
 	if err != nil {
 		return "", err
 	}
@@ -226,11 +315,15 @@ func (a *app) openReport(ctx context.Context, project, role, session string, sta
 	if err := a.st.SetSessionStatus(ctx, sid, "pausada"); err != nil {
 		slog.Warn("no se pudo pausar la sesión", "err", err)
 	}
-	// Notifica al panel (vía gateway) que llegó un reporte nuevo.
-	payload, _ := json.Marshal(map[string]string{"report_id": reportID, "project": project})
-	_ = a.nc.Publish("onix.report."+project, payload)
+	a.notifyReport(reportID, project)
 	slog.Info("reporte creado · sesión pausada", "report_id", reportID, "session", session, "stage", stage)
 	return reportID, nil
+}
+
+// notifyReport avisa al panel (vía gateway) que hay un reporte nuevo.
+func (a *app) notifyReport(reportID, project string) {
+	payload, _ := json.Marshal(map[string]string{"report_id": reportID, "project": project})
+	_ = a.nc.Publish("onix.report."+project, payload)
 }
 
 // waitForBoss bloquea hasta la respuesta del jefe o el timeout (no cuelga para siempre).
@@ -333,6 +426,38 @@ func toStrSlice(v any) []string {
 	for _, e := range arr {
 		if s, ok := e.(string); ok {
 			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// toPlanStages acepta el arg "stages" como lista de objetos {name, description?, depends_on?}
+// o, de forma tolerante, como lista de strings (solo nombres).
+func toPlanStages(v any) []store.PlanStage {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]store.PlanStage, 0, len(arr))
+	for _, e := range arr {
+		switch x := e.(type) {
+		case string:
+			if x != "" {
+				out = append(out, store.PlanStage{Name: x})
+			}
+		case map[string]any:
+			name := toStr(x["name"])
+			if name == "" {
+				continue
+			}
+			ps := store.PlanStage{Name: name, Description: toStr(x["description"])}
+			if d, ok := x["depends_on"]; ok {
+				n := toInt(d)
+				if n > 0 {
+					ps.DependsOn = &n
+				}
+			}
+			out = append(out, ps)
 		}
 	}
 	return out

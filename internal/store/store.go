@@ -1,4 +1,5 @@
-// Package store: acceso a Postgres para el plano de control (reports, sessions, stages, messages).
+// Package store: acceso a Postgres para el plano de control.
+// Modelo v2: tickets + plan de ejecución DINÁMICO por ticket (las fases las genera el agente).
 package store
 
 import (
@@ -30,8 +31,8 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 	return &Store{pool: pool}, nil
 }
 
-func (s *Store) Close()                         { s.pool.Close() }
-func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+func (s *Store) Close()                          { s.pool.Close() }
+func (s *Store) Ping(ctx context.Context) error  { return s.pool.Ping(ctx) }
 
 func (s *Store) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -46,14 +47,32 @@ func (s *Store) WaitReady(ctx context.Context, timeout time.Duration) error {
 	}
 }
 
-// Stage es una etapa del plan de 12.
+// ─────────────── entidades ───────────────
+
 type Stage struct {
-	Number int    `json:"number"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	Number      int     `json:"number"`
+	Name        string  `json:"name"`
+	Status      string  `json:"status"`
+	Description *string `json:"description,omitempty"`
+	DependsOn   *int    `json:"depends_on,omitempty"`
 }
 
-// EnsureProject / Agent / Session (idempotentes), como en los otros servicios.
+// PlanStage: una fase del plan que envía el agente en registrar_plan.
+type PlanStage struct {
+	Name        string
+	Description string
+	DependsOn   *int
+}
+
+type Ticket struct {
+	ID     string
+	Title  string
+	Body   string
+	Status string
+}
+
+// ─────────────── project / agent / session ───────────────
+
 func (s *Store) EnsureProject(ctx context.Context, name string) (string, error) {
 	if name == "" {
 		name = "onixguard"
@@ -92,33 +111,80 @@ func (s *Store) SetSessionStatus(ctx context.Context, sessionID, status string) 
 	return err
 }
 
-// SeedStages crea las 12 etapas del proyecto si no existen (1 = activa, resto pendiente).
-func (s *Store) SeedStages(ctx context.Context, projectID string) error {
-	var n int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE project_id=$1`, projectID).Scan(&n); err != nil {
+// ─────────────── tickets ───────────────
+
+// OpenTicket devuelve el ticket activo a planear (último 'nuevo' o 'en_plan'); nil si no hay.
+func (s *Store) OpenTicket(ctx context.Context, projectID string) (*Ticket, error) {
+	var t Ticket
+	var body *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, title, body, status FROM tickets
+		 WHERE project_id=$1 AND status IN ('nuevo','en_plan','plan_espera')
+		 ORDER BY created_at DESC LIMIT 1`, projectID).Scan(&t.ID, &t.Title, &body, &t.Status)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		t.Body = *body
+	}
+	return &t, nil
+}
+
+func (s *Store) CreateTicket(ctx context.Context, projectID, title, body, source string) (string, error) {
+	if title == "" {
+		title = "Ticket sin título"
+	}
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO tickets (project_id, title, body, source) VALUES ($1,$2,$3,$4) RETURNING id`,
+		projectID, title, body, source).Scan(&id)
+	return id, err
+}
+
+func (s *Store) SetTicketStatus(ctx context.Context, ticketID, status string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE tickets SET status=$2 WHERE id=$1`, ticketID, status)
+	return err
+}
+
+// ReplaceTicketStages borra las fases previas del ticket y crea el plan nuevo (todas 'pendiente').
+func (s *Store) ReplaceTicketStages(ctx context.Context, projectID, ticketID string, plan []PlanStage) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `DELETE FROM stages WHERE ticket_id=$1`, ticketID); err != nil {
+		return err
 	}
-	for i := 1; i <= 12; i++ {
-		status := "pendiente"
-		if i == 1 {
-			status = "activa"
-		}
-		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO stages (project_id, number, name, status) VALUES ($1,$2,$3,$4)
-			 ON CONFLICT (project_id, number) DO NOTHING`,
-			projectID, i, fmt.Sprintf("Etapa %d", i), status); err != nil {
+	for i, ps := range plan {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO stages (project_id, ticket_id, number, name, description, depends_on, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,'pendiente')`,
+			projectID, ticketID, i+1, ps.Name, nullStr(ps.Description), ps.DependsOn); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
-func (s *Store) Stages(ctx context.Context, projectID string) ([]Stage, int, error) {
+// ─────────────── plan (dinámico, por ticket) ───────────────
+
+// LatestTicketID devuelve el ticket más reciente del proyecto (el que se muestra en Monitoreo).
+func (s *Store) LatestTicketID(ctx context.Context, projectID string) (string, bool, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT id FROM tickets WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1`, projectID).Scan(&id)
+	if err == pgx.ErrNoRows {
+		return "", false, nil
+	}
+	return id, err == nil, err
+}
+
+func (s *Store) StagesForTicket(ctx context.Context, ticketID string) ([]Stage, int, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT number, name, status FROM stages WHERE project_id=$1 ORDER BY number`, projectID)
+		`SELECT number, name, status, description, depends_on FROM stages WHERE ticket_id=$1 ORDER BY number`, ticketID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -127,7 +193,7 @@ func (s *Store) Stages(ctx context.Context, projectID string) ([]Stage, int, err
 	current := 1
 	for rows.Next() {
 		var st Stage
-		if err := rows.Scan(&st.Number, &st.Name, &st.Status); err != nil {
+		if err := rows.Scan(&st.Number, &st.Name, &st.Status, &st.Description, &st.DependsOn); err != nil {
 			return nil, 0, err
 		}
 		if st.Status == "activa" {
@@ -138,33 +204,32 @@ func (s *Store) Stages(ctx context.Context, projectID string) ([]Stage, int, err
 	return out, current, rows.Err()
 }
 
-func (s *Store) stageID(ctx context.Context, projectID string, number int) (*string, error) {
-	var id string
-	err := s.pool.QueryRow(ctx, `SELECT id FROM stages WHERE project_id=$1 AND number=$2`, projectID, number).Scan(&id)
-	if err == pgx.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &id, nil
-}
+// ─────────────── reportes ───────────────
 
-// CreateReport crea el reporte (status 'espera') y devuelve su id.
-func (s *Store) CreateReport(ctx context.Context, projectID, agentID string, stageNumber int, title, summary string, deliverables, decisions []string) (string, error) {
-	stageID, _ := s.stageID(ctx, projectID, stageNumber)
+// CreateReport crea un reporte (status 'espera'). ticketID y stageNumber son opcionales (0/"" = ninguno).
+func (s *Store) CreateReport(ctx context.Context, projectID, agentID string, ticketID string, stageNumber int, title, summary string, deliverables, decisions []string) (string, error) {
+	var stageID *string
+	if ticketID != "" && stageNumber > 0 {
+		var sid string
+		if err := s.pool.QueryRow(ctx, `SELECT id FROM stages WHERE ticket_id=$1 AND number=$2`, ticketID, stageNumber).Scan(&sid); err == nil {
+			stageID = &sid
+		}
+	}
+	var tid *string
+	if ticketID != "" {
+		tid = &ticketID
+	}
 	del, _ := json.Marshal(deliverables)
 	dec, _ := json.Marshal(decisions)
 	var id string
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO reports (project_id, agent_id, stage_id, title, status, summary, deliverables, decisions)
-		 VALUES ($1,$2,$3,$4,'espera',$5,$6::jsonb,$7::jsonb) RETURNING id`,
-		projectID, agentID, stageID, title, summary, string(del), string(dec)).Scan(&id)
+		`INSERT INTO reports (project_id, agent_id, ticket_id, stage_id, title, status, summary, deliverables, decisions)
+		 VALUES ($1,$2,$3,$4,$5,'espera',$6,$7::jsonb,$8::jsonb) RETURNING id`,
+		projectID, agentID, tid, stageID, title, summary, string(del), string(dec)).Scan(&id)
 	return id, err
 }
 
-// RespondReport aplica la decisión del jefe: actualiza estado, guarda el mensaje y reanuda la sesión.
-// Devuelve el claude_session_id de la sesión asociada (para publicar en onix.ctrl.<sesión>).
+// RespondReport aplica la decisión del jefe: estado, mensaje, reanuda sesión y avanza plan/ticket.
 func (s *Store) RespondReport(ctx context.Context, reportID, action, message string) (claudeSessionID string, err error) {
 	status := map[string]string{"aprobar": "aprobado", "cambios": "cambios", "responder": "respondido"}[action]
 	if status == "" {
@@ -176,25 +241,38 @@ func (s *Store) RespondReport(ctx context.Context, reportID, action, message str
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var agentID string
-	var projectID string
-	var stageID *string
-	if err := tx.QueryRow(ctx, `UPDATE reports SET status=$2 WHERE id=$1 RETURNING agent_id, project_id, stage_id`, reportID, status).Scan(&agentID, &projectID, &stageID); err != nil {
+	var agentID, projectID string
+	var stageID, ticketID *string
+	if err := tx.QueryRow(ctx,
+		`UPDATE reports SET status=$2 WHERE id=$1 RETURNING agent_id, project_id, stage_id, ticket_id`,
+		reportID, status).Scan(&agentID, &projectID, &stageID, &ticketID); err != nil {
 		return "", fmt.Errorf("update report: %w", err)
 	}
-	// Al APROBAR un reporte de etapa: esa etapa pasa a 'hecha' y la siguiente a 'activa'.
-	if action == "aprobar" && stageID != nil {
-		var num int
-		if err := tx.QueryRow(ctx, `UPDATE stages SET status='hecha', ended_at=now() WHERE id=$1 RETURNING number`, *stageID).Scan(&num); err == nil {
-			_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE project_id=$1 AND number=$2 AND status='pendiente'`, projectID, num+1)
+
+	if action == "aprobar" {
+		switch {
+		case stageID != nil:
+			// Reporte de una fase: esa fase 'hecha', la siguiente 'activa'.
+			var num int
+			var tid *string
+			if err := tx.QueryRow(ctx, `UPDATE stages SET status='hecha', ended_at=now() WHERE id=$1 RETURNING number, ticket_id`, *stageID).Scan(&num, &tid); err == nil && tid != nil {
+				_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE ticket_id=$1 AND number=$2 AND status='pendiente'`, *tid, num+1)
+			}
+		case ticketID != nil:
+			// Reporte de PLAN: se aprueba el plan → ticket 'aprobado' y la 1ª fase 'activa'.
+			_, _ = tx.Exec(ctx, `UPDATE tickets SET status='aprobado' WHERE id=$1`, *ticketID)
+			_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE ticket_id=$1 AND number=1`, *ticketID)
 		}
+	} else if action == "cambios" && ticketID != nil && stageID == nil {
+		// Plan rechazado: el ticket vuelve a planeación.
+		_, _ = tx.Exec(ctx, `UPDATE tickets SET status='en_plan' WHERE id=$1`, *ticketID)
 	}
+
 	if message != "" {
 		if _, err := tx.Exec(ctx, `INSERT INTO messages (report_id, sender, body) VALUES ($1,'jefe',$2)`, reportID, message); err != nil {
 			return "", fmt.Errorf("insert message: %w", err)
 		}
 	}
-	// Reanuda la(s) sesión(es) del agente que estaban pausadas.
 	rows, err := tx.Query(ctx, `UPDATE sessions SET status='activa' WHERE agent_id=$1 AND status='pausada' RETURNING claude_session_id`, agentID)
 	if err != nil {
 		return "", err
@@ -209,10 +287,16 @@ func (s *Store) RespondReport(ctx context.Context, reportID, action, message str
 	return claudeSessionID, nil
 }
 
-// AgentMessage guarda el texto del agente (resumen/pregunta) como primer mensaje del chat.
 func (s *Store) AgentMessage(ctx context.Context, reportID, body string) {
 	if body == "" {
 		return
 	}
 	_, _ = s.pool.Exec(ctx, `INSERT INTO messages (report_id, sender, body) VALUES ($1,'agente',$2)`, reportID, body)
+}
+
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
