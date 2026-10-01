@@ -1,2 +1,12 @@
+# Go
+/bin/
+/out/
+/onix-orchestrator
+*.test
+*.out
+
+# OS
+.DS_Store
+
 # grafo de conocimiento (generado, local)
 graphify-out/

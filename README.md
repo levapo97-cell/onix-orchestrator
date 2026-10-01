@@ -2,7 +2,23 @@
 
 **Plano de control** de OnixGuard. Escrito en **Go**. Expone el **servidor MCP** que usan los agentes, maneja la **pausa/reanudación**, el flujo de **12 etapas** y las **alertas**; a futuro, el canal de control remoto de la PC.
 
-> **Estado:** se construye en **Fase 3**. Este README documenta su diseño.
+> **Estado (Fase 3 ✅):** implementado. Servidor **MCP** (streamable HTTP en `:8084/mcp`, lib `mark3labs/mcp-go`) con `reportar_al_jefe` / `pedir_al_jefe` / `consultar_plan`. Las dos primeras son **bloqueantes**: crean el reporte, pausan la sesión y no retornan hasta que el jefe responde (vía gateway) o expira el timeout. HTTP de control en `:8085` (`POST /respond`, `/healthz`). Verificado E2E (2026-09-30): reportar → `pausada` → responder → la llamada MCP retorna `{action,message}` → `activa`.
+
+## Cómo identifica al agente
+El agente (Claude Code) se conecta al MCP con cabeceras `X-Onix-Session`, `X-Onix-Project`, `X-Onix-Role`; el orchestrator las lee (vía `WithHTTPContextFunc`) para registrar `session`/`agent` y crear el reporte.
+
+## Estructura
+```text
+cmd/onix-orchestrator/main.go   # MCP server + control HTTP + tools
+internal/store/                 # reports, sessions, stages, messages (pgx)
+internal/pending/               # registro en memoria de llamadas MCP bloqueadas (report_id→chan)
+Dockerfile                      # multi-stage (golang:1.26 → distroless)
+```
+
+## Puertos y env
+`MCP_PORT` (8084), `PORT` control (8085), `NATS_URL`, `DATABASE_URL`, `REPORT_TIMEOUT_MIN` (15).
+
+> ⚠️ Cloudflare corta conexiones idle (~100s): el MCP bloqueante necesita, en prod, keepalive del transporte streamable + timeouts altos en nginx/Cloudflare, o migrar a long-poll con token de reanudación. El `REPORT_TIMEOUT_MIN` garantiza que la llamada **no cuelga para siempre** (retorna `{action:"timeout"}`).
 
 ---
 
