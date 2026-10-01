@@ -315,6 +315,18 @@ func (a *app) openReport(ctx context.Context, project, role, session string, sta
 	if err := a.st.SetSessionStatus(ctx, sid, "pausada"); err != nil {
 		slog.Warn("no se pudo pausar la sesión", "err", err)
 	}
+	// Pausa EN CASCADA: las fases que dependen de esta quedan 'bloqueada' y sus agentes pausados.
+	if stage > 0 && ticketID != "" {
+		if paused, err := a.st.CascadeBlock(ctx, pid, ticketID, stage); err == nil {
+			for _, cs := range paused {
+				ctrl, _ := json.Marshal(map[string]string{"action": "pausa", "message": "bloqueado por dependencia de la fase " + strconv.Itoa(stage)})
+				_ = a.nc.Publish("onix.ctrl."+cs, ctrl)
+			}
+			if len(paused) > 0 {
+				slog.Info("pausa en cascada", "dependientes_pausados", len(paused), "fase", stage)
+			}
+		}
+	}
 	a.notifyReport(reportID, project)
 	slog.Info("reporte creado · sesión pausada", "report_id", reportID, "session", session, "stage", stage)
 	return reportID, nil
@@ -355,16 +367,16 @@ func (a *app) handleRespond(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "report_id y action son obligatorios"})
 		return
 	}
-	// Persiste la decisión y reanuda la sesión.
-	claudeSession, err := a.st.RespondReport(r.Context(), body.ReportID, body.Action, body.Message)
+	// Persiste la decisión, reanuda la sesión y desbloquea en cascada.
+	resumed, err := a.st.RespondReport(r.Context(), body.ReportID, body.Action, body.Message)
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
 	}
-	// Publica en onix.ctrl.<sesión> (auditoría + futuro onix-agent).
-	if claudeSession != "" {
+	// Publica en onix.ctrl.<sesión> para cada sesión reanudada (reportante + cascada).
+	for _, cs := range resumed {
 		ctrl, _ := json.Marshal(map[string]string{"action": body.Action, "message": body.Message})
-		_ = a.nc.Publish("onix.ctrl."+claudeSession, ctrl)
+		_ = a.nc.Publish("onix.ctrl."+cs, ctrl)
 	}
 	// Retorna la llamada MCP pendiente (si sigue viva en esta instancia).
 	resolved := a.reg.Resolve(body.ReportID, pending.Response{Action: body.Action, Message: body.Message})
@@ -450,7 +462,7 @@ func toPlanStages(v any) []store.PlanStage {
 			if name == "" {
 				continue
 			}
-			ps := store.PlanStage{Name: name, Description: toStr(x["description"])}
+			ps := store.PlanStage{Name: name, Description: toStr(x["description"]), Role: toStr(x["role"])}
 			if d, ok := x["depends_on"]; ok {
 				n := toInt(d)
 				if n > 0 {

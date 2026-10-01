@@ -62,6 +62,7 @@ type PlanStage struct {
 	Name        string
 	Description string
 	DependsOn   *int
+	Role        string // rol que trabaja la fase (opcional) — para la pausa en cascada
 }
 
 type Ticket struct {
@@ -161,9 +162,9 @@ func (s *Store) ReplaceTicketStages(ctx context.Context, projectID, ticketID str
 	}
 	for i, ps := range plan {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO stages (project_id, ticket_id, number, name, description, depends_on, status)
-			 VALUES ($1,$2,$3,$4,$5,$6,'pendiente')`,
-			projectID, ticketID, i+1, ps.Name, nullStr(ps.Description), ps.DependsOn); err != nil {
+			`INSERT INTO stages (project_id, ticket_id, number, name, description, depends_on, agent_role, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,'pendiente')`,
+			projectID, ticketID, i+1, ps.Name, nullStr(ps.Description), ps.DependsOn, nullStr(ps.Role)); err != nil {
 			return err
 		}
 	}
@@ -229,15 +230,17 @@ func (s *Store) CreateReport(ctx context.Context, projectID, agentID string, tic
 	return id, err
 }
 
-// RespondReport aplica la decisión del jefe: estado, mensaje, reanuda sesión y avanza plan/ticket.
-func (s *Store) RespondReport(ctx context.Context, reportID, action, message string) (claudeSessionID string, err error) {
+// RespondReport aplica la decisión del jefe: estado, mensaje, reanuda sesión, avanza plan/ticket
+// y DESBLOQUEA en cascada las fases/sesiones que dependían de la fase aprobada.
+// Devuelve TODAS las claude_session_id reanudadas (el que reportó + los liberados en cascada).
+func (s *Store) RespondReport(ctx context.Context, reportID, action, message string) (resumed []string, err error) {
 	status := map[string]string{"aprobar": "aprobado", "cambios": "cambios", "responder": "respondido"}[action]
 	if status == "" {
-		return "", fmt.Errorf("acción inválida: %s", action)
+		return nil, fmt.Errorf("acción inválida: %s", action)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
@@ -246,9 +249,10 @@ func (s *Store) RespondReport(ctx context.Context, reportID, action, message str
 	if err := tx.QueryRow(ctx,
 		`UPDATE reports SET status=$2 WHERE id=$1 RETURNING agent_id, project_id, stage_id, ticket_id`,
 		reportID, status).Scan(&agentID, &projectID, &stageID, &ticketID); err != nil {
-		return "", fmt.Errorf("update report: %w", err)
+		return nil, fmt.Errorf("update report: %w", err)
 	}
 
+	var unblockRoles []string
 	if action == "aprobar" {
 		switch {
 		case stageID != nil:
@@ -256,35 +260,99 @@ func (s *Store) RespondReport(ctx context.Context, reportID, action, message str
 			var num int
 			var tid *string
 			if err := tx.QueryRow(ctx, `UPDATE stages SET status='hecha', ended_at=now() WHERE id=$1 RETURNING number, ticket_id`, *stageID).Scan(&num, &tid); err == nil && tid != nil {
-				_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE ticket_id=$1 AND number=$2 AND status='pendiente'`, *tid, num+1)
+				// 1) Desbloqueo en cascada PRIMERO: fases que dependían de esta vuelven a 'pendiente'
+				//    y recolectamos sus roles (para reanudar sus sesiones). Debe ir antes de activar
+				//    la siguiente fase, porque esa fase puede ser a la vez dependiente y la "siguiente".
+				r, _ := tx.Query(ctx, `UPDATE stages SET status='pendiente' WHERE ticket_id=$1 AND depends_on=$2 AND status='bloqueada' RETURNING agent_role`, *tid, num)
+				for r.Next() {
+					var role *string
+					_ = r.Scan(&role)
+					if role != nil && *role != "" {
+						unblockRoles = append(unblockRoles, *role)
+					}
+				}
+				r.Close()
+				// 2) Ahora sí, activa la fase siguiente.
+				_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE ticket_id=$1 AND number=$2 AND status IN ('pendiente','bloqueada')`, *tid, num+1)
 			}
 		case ticketID != nil:
-			// Reporte de PLAN: se aprueba el plan → ticket 'aprobado' y la 1ª fase 'activa'.
+			// Reporte de PLAN: se aprueba → ticket 'aprobado' y la 1ª fase 'activa'.
 			_, _ = tx.Exec(ctx, `UPDATE tickets SET status='aprobado' WHERE id=$1`, *ticketID)
 			_, _ = tx.Exec(ctx, `UPDATE stages SET status='activa', started_at=now() WHERE ticket_id=$1 AND number=1`, *ticketID)
 		}
 	} else if action == "cambios" && ticketID != nil && stageID == nil {
-		// Plan rechazado: el ticket vuelve a planeación.
 		_, _ = tx.Exec(ctx, `UPDATE tickets SET status='en_plan' WHERE id=$1`, *ticketID)
 	}
 
 	if message != "" {
 		if _, err := tx.Exec(ctx, `INSERT INTO messages (report_id, sender, body) VALUES ($1,'jefe',$2)`, reportID, message); err != nil {
-			return "", fmt.Errorf("insert message: %w", err)
+			return nil, fmt.Errorf("insert message: %w", err)
 		}
 	}
+	// Reanuda la sesión del agente que reportó.
 	rows, err := tx.Query(ctx, `UPDATE sessions SET status='activa' WHERE agent_id=$1 AND status='pausada' RETURNING claude_session_id`, agentID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	for rows.Next() {
-		_ = rows.Scan(&claudeSessionID)
+		var c string
+		_ = rows.Scan(&c)
+		resumed = append(resumed, c)
 	}
 	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return "", err
+	// Reanuda en cascada las sesiones de los roles desbloqueados.
+	for _, role := range unblockRoles {
+		r, err := tx.Query(ctx, `UPDATE sessions SET status='activa' WHERE project_id=$1 AND status='pausada' AND agent_id IN (SELECT id FROM agents WHERE project_id=$1 AND role=$2) RETURNING claude_session_id`, projectID, role)
+		if err != nil {
+			return nil, err
+		}
+		for r.Next() {
+			var c string
+			_ = r.Scan(&c)
+			resumed = append(resumed, c)
+		}
+		r.Close()
 	}
-	return claudeSessionID, nil
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return resumed, nil
+}
+
+// CascadeBlock marca 'bloqueada' las fases que dependen de blockedStage y pausa las sesiones
+// de los roles que las trabajan. Devuelve los claude_session_id pausados (para onix.ctrl).
+func (s *Store) CascadeBlock(ctx context.Context, projectID, ticketID string, blockedStage int) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`UPDATE stages SET status='bloqueada' WHERE ticket_id=$1 AND depends_on=$2 AND status IN ('pendiente','activa') RETURNING agent_role`,
+		ticketID, blockedStage)
+	if err != nil {
+		return nil, err
+	}
+	var roles []string
+	for rows.Next() {
+		var r *string
+		_ = rows.Scan(&r)
+		if r != nil && *r != "" {
+			roles = append(roles, *r)
+		}
+	}
+	rows.Close()
+	var paused []string
+	for _, role := range roles {
+		rs, err := s.pool.Query(ctx,
+			`UPDATE sessions SET status='pausada' WHERE project_id=$1 AND status='activa' AND agent_id IN (SELECT id FROM agents WHERE project_id=$1 AND role=$2) RETURNING claude_session_id`,
+			projectID, role)
+		if err != nil {
+			return paused, err
+		}
+		for rs.Next() {
+			var c string
+			_ = rs.Scan(&c)
+			paused = append(paused, c)
+		}
+		rs.Close()
+	}
+	return paused, nil
 }
 
 func (s *Store) AgentMessage(ctx context.Context, reportID, body string) {
